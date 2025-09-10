@@ -176,6 +176,7 @@ where
 {
     /// Runs the [`ChainWorkerActor`]. The chain state is loaded when the first request
     /// arrives.
+    #[instrument(target = "telemetry_only", skip_all, fields(chain_id = %chain_id))]
     #[expect(clippy::too_many_arguments)]
     pub(crate) async fn run(
         config: ChainWorkerConfig,
@@ -207,6 +208,7 @@ where
     /// Spawns a blocking task to execute the service runtime actor.
     ///
     /// Returns the task handle and the endpoints to interact with the actor.
+    #[instrument(target = "telemetry_only", skip_all, fields(chain_id = %chain_id))]
     async fn spawn_service_runtime_actor(
         chain_id: ChainId,
     ) -> (linera_base::task::Blocking, ServiceRuntimeEndpoint) {
@@ -243,8 +245,9 @@ where
 
     /// Runs the worker until there are no more incoming requests.
     #[instrument(
+        target = "telemetry_only",
         skip_all,
-        fields(chain_id = format!("{:.8}", self.chain_id)),
+        fields(chain_id = %self.chain_id, long_lived_services = %self.config.long_lived_services),
     )]
     async fn handle_requests(
         self,
@@ -256,29 +259,36 @@ where
         trace!("Starting `ChainWorkerActor`");
 
         while let Some((request, span)) = incoming_requests.recv().await {
-            let (service_runtime_thread, service_runtime_endpoint) = {
-                if self.config.long_lived_services {
-                    let (thread, endpoint) = Self::spawn_service_runtime_actor(self.chain_id).await;
-                    (Some(thread), Some(endpoint))
-                } else {
-                    (None, None)
-                }
-            };
+            let (service_runtime_thread, mut worker) = async {
+                let (service_runtime_thread, service_runtime_endpoint) = {
+                    if self.config.long_lived_services {
+                        let (thread, endpoint) =
+                            Self::spawn_service_runtime_actor(self.chain_id).await;
+                        (Some(thread), Some(endpoint))
+                    } else {
+                        (None, None)
+                    }
+                };
 
-            trace!("Loading chain state of {}", self.chain_id);
-            let mut worker = ChainWorkerState::load(
-                self.config.clone(),
-                self.storage.clone(),
-                self.block_values.clone(),
-                self.execution_state_cache.clone(),
-                self.tracked_chains.clone(),
-                self.delivery_notifier.clone(),
-                self.chain_id,
-                service_runtime_endpoint,
-            )
+                trace!("Loading chain state of {}", self.chain_id);
+                let mut worker = ChainWorkerState::load(
+                    self.config.clone(),
+                    self.storage.clone(),
+                    self.block_values.clone(),
+                    self.execution_state_cache.clone(),
+                    self.tracked_chains.clone(),
+                    self.delivery_notifier.clone(),
+                    self.chain_id,
+                    service_runtime_endpoint,
+                )
+                .await?;
+
+                worker.handle_request(request).await;
+
+                Ok::<_, WorkerError>((service_runtime_thread, worker))
+            }
+            .instrument(span)
             .await?;
-
-            Box::pin(worker.handle_request(request).instrument(span)).await;
 
             loop {
                 futures::select! {
