@@ -23,7 +23,8 @@ use linera_storage::Storage;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use tonic::{transport::Channel, Request, Response, Status};
-use tower::{builder::ServiceBuilder, Layer, Service};
+use tonic_tracing_opentelemetry::middleware::server as otel_server;
+use tower::{Layer, Service};
 use tracing::{debug, error, info, instrument, trace, warn};
 
 use super::{
@@ -45,6 +46,7 @@ use crate::{
 };
 
 type CrossChainSender = mpsc::Sender<(linera_core::data_types::CrossChainRequest, ShardId)>;
+
 type NotificationSender = tokio::sync::broadcast::Sender<Notification>;
 
 #[cfg(with_metrics)]
@@ -260,11 +262,8 @@ where
                 .await;
 
             tonic::transport::Server::builder()
-                .layer(
-                    ServiceBuilder::new()
-                        .layer(GrpcPrometheusMetricsMiddlewareLayer)
-                        .into_inner(),
-                )
+                .layer(otel_server::OtelGrpcLayer::default())
+                .layer(GrpcPrometheusMetricsMiddlewareLayer)
                 .add_service(health_service)
                 .add_service(reflection_service)
                 .add_service(worker_node)
@@ -387,7 +386,7 @@ where
         let pool = GrpcConnectionPool::default();
         let handle_request =
             move |shard_id: ShardId, request: linera_core::data_types::CrossChainRequest| {
-                let channel_result = pool.channel(network.shard(shard_id).http_address());
+                let channel_result = pool.otel_channel(network.shard(shard_id).http_address());
                 async move {
                     let mut client = ValidatorWorkerClient::new(channel_result?)
                         .max_encoding_message_size(GRPC_MAX_MESSAGE_SIZE)
